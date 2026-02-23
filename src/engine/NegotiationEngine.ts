@@ -1,4 +1,5 @@
 import { AgentCoordinationMessage, MessageType } from '../schema/MessageSchema';
+import { ConflictDetail, ConflictResolutionEngine } from './ConflictResolutionEngine';
 
 export enum NegotiationState {
   PROPOSAL = 'PROPOSAL',
@@ -81,6 +82,18 @@ export interface NegotiationEngineConfig {
   sharedTreasuryProvider?: SharedTreasuryProvider;
   downstreamCostProvider?: DownstreamCostProvider;
   economicGuardrails?: EconomicGuardrails;
+  conflictResolutionEngine?: ConflictResolutionEngine;
+  renegotiationHandler?: RenegotiationHandler;
+}
+
+export interface RenegotiationContext {
+  sessionId: string;
+  message: AgentCoordinationMessage;
+  conflicts: ConflictDetail[];
+}
+
+export interface RenegotiationHandler {
+  trigger(context: RenegotiationContext): void;
 }
 
 interface NegotiationSession {
@@ -92,12 +105,15 @@ export interface TransitionResult {
   accepted: boolean;
   state?: NegotiationState;
   reason?: string;
-  action?: 'ALLOW' | 'RENEGOTIATE' | 'BLOCK';
+  action?: 'ALLOW' | 'RENEGOTIATE' | 'BLOCK' | 'PAUSE_AND_RENEGOTIATE';
   economicViolations?: string[];
+  paused?: boolean;
+  conflicts?: ConflictDetail[];
 }
 
 export class NegotiationEngine {
   private readonly sessions = new Map<string, NegotiationSession>();
+  private readonly pausedSessions = new Set<string>();
 
   public constructor(private readonly config: NegotiationEngineConfig) { }
 
@@ -113,6 +129,15 @@ export class NegotiationEngine {
     const sessionId = message.correlationId ?? message.messageId;
     const session = this.sessions.get(sessionId) ?? { id: sessionId, state: null };
 
+    if (this.pausedSessions.has(sessionId) && !message.metadata?.renegotiation?.resolutionAccepted) {
+      return {
+        accepted: false,
+        reason: `Session "${sessionId}" is paused until renegotiation confirms conflict resolution.`,
+        action: 'PAUSE_AND_RENEGOTIATE',
+        paused: true
+      };
+    }
+
     const predecessor = REQUIRED_PREDECESSOR[nextState];
     if (session.state !== predecessor) {
       return {
@@ -126,13 +151,26 @@ export class NegotiationEngine {
       return gateResult;
     }
 
+    const conflictResult = this.evaluateConflicts(message, sessionId);
+    if (conflictResult) {
+      return conflictResult;
+    }
+
     session.state = nextState;
     this.sessions.set(sessionId, session);
+    this.config.conflictResolutionEngine?.register(message, sessionId);
+    if (message.metadata?.renegotiation?.resolutionAccepted) {
+      this.pausedSessions.delete(sessionId);
+    }
     return { accepted: true, state: nextState, action: 'ALLOW' };
   }
 
   public getState(sessionId: string): NegotiationState | null {
     return this.sessions.get(sessionId)?.state ?? null;
+  }
+
+  public resumeSession(sessionId: string): void {
+    this.pausedSessions.delete(sessionId);
   }
 
   private validateGates(
@@ -158,7 +196,6 @@ export class NegotiationEngine {
       };
     }
 
-    const budget = message.content.resources.budget;
     if (budget.amount > budget.limit) {
       return {
         accepted: false,
@@ -290,6 +327,32 @@ export class NegotiationEngine {
         : `Renegotiation required due to economic limits: ${violations.join(' ')}`,
       action: shouldBlock ? 'BLOCK' : 'RENEGOTIATE',
       economicViolations: violations
+    };
+  }
+
+  private evaluateConflicts(message: AgentCoordinationMessage, sessionId: string): TransitionResult | null {
+    if (!this.config.conflictResolutionEngine) {
+      return null;
+    }
+
+    const conflictCheck = this.config.conflictResolutionEngine.evaluate(message, sessionId);
+    if (!conflictCheck.hasConflict) {
+      return null;
+    }
+
+    this.pausedSessions.add(sessionId);
+    this.config.renegotiationHandler?.trigger({
+      sessionId,
+      message,
+      conflicts: conflictCheck.conflicts
+    });
+
+    return {
+      accepted: false,
+      reason: `Execution paused due to detected conflicts. Renegotiation required before proceeding.`,
+      action: 'PAUSE_AND_RENEGOTIATE',
+      paused: true,
+      conflicts: conflictCheck.conflicts
     };
   }
 }

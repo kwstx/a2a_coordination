@@ -1,0 +1,19 @@
+﻿=== Reputation and Synergy Coordination System ===
+
+--- Step 1: Building Reputation ---
+Alice Score: 0.98
+
+--- Step 2: Negotiation Weighting (Synergy) ---
+Synergy Multiplier (Alice-Bob): 1.09
+Alice Offer with 14% ROI (15% req): ACCEPTED
+Result: Accepted because synergy lowered the ROI threshold to ~13.7%.
+
+--- Step 3: Trust Thresholds ---
+Malory ($400k offer) Result: REJECTED
+Reason: Reputation score 0.05 is below required threshold 0.44 for this transaction.
+Alice ($400k offer) Result: ACCEPTED
+
+--- Step 4: Commitment Validation ---
+Malory (Score: 0.16) Commitment (No Escrow): REJECTED
+Reason: Reputation score 0.16 is below required threshold 0.40 for this transaction.
+Malory Commitment (With Escrow): REJECTED
