@@ -4,9 +4,10 @@ import { NegotiationEngine, NegotiationState, TransitionResult } from '../../eng
 import { SettlementEngine, ActualDeliverable, SettlementReport } from '../../engine/SettlementEngine';
 import { ConflictResolutionEngine, ConflictCheckResult } from '../../engine/ConflictResolutionEngine';
 import { CoordinationPolicyValidator } from '../../engine/CoordinationPolicyValidator';
-import { SharedTaskContract } from '../../schema/ContractSchema';
+import { SharedTaskContract, ContractFactory } from '../../schema/ContractSchema';
 import { ReputationAndSynergyModule } from '../../engine/ReputationAndSynergyModule';
 import { BudgetManager } from '../../engine/BudgetManager';
+import { CoordinationPolicy, ValidationResponse } from '../../schema/PolicySchema';
 import { v4 as uuidv4 } from 'uuid';
 
 export interface CoordinationSession {
@@ -27,22 +28,32 @@ export class CoordinationService {
     private reputationModule: ReputationAndSynergyModule;
     private budgetManager: BudgetManager;
 
+    private defaultPolicy: CoordinationPolicy = {
+        id: 'default-policy',
+        name: 'Standard Coordination Policy',
+        economic: {
+            minRoi: 0.1,
+            maxBudget: 1000000
+        },
+        compliance: {
+            maxRiskScore: 0.5
+        }
+    };
+
     constructor() {
-        // Initialize engines with default or mock providers for now
         this.reputationModule = new ReputationAndSynergyModule();
         this.budgetManager = new BudgetManager();
         this.conflictEngine = new ConflictResolutionEngine();
         this.policyValidator = new CoordinationPolicyValidator();
         this.settlementEngine = new SettlementEngine(this.reputationModule, this.budgetManager);
 
-        // NegotiationEngine needs providers
         const mockProviders = this.createMockProviders();
         this.negotiationEngine = new NegotiationEngine({
             ...mockProviders,
             minimumReputationScore: 0.5,
             conflictResolutionEngine: this.conflictEngine,
             auditSink: {
-                record: (event: any) => {
+                record: (event) => {
                     console.log('[Audit]', JSON.stringify(event));
                     return {} as any;
                 }
@@ -82,48 +93,38 @@ export class CoordinationService {
         return { sessionId: id, result };
     }
 
-    public async validateMessage(message: AgentCoordinationMessage): Promise<any> {
-        return this.policyValidator.validate(message);
+    public async validateMessage(message: AgentCoordinationMessage, policy?: CoordinationPolicy): Promise<ValidationResponse> {
+        return this.policyValidator.evaluate(message, policy || this.defaultPolicy);
     }
 
     public async createContract(sessionId: string): Promise<SharedTaskContract> {
         const session = this.sessions.get(sessionId);
         if (!session) throw new Error('Session not found');
         if (session.state !== NegotiationState.FINAL_COMMITMENT) {
-            throw new Error('Negotiation not finalized');
+            throw new Error(`Negotiation not finalized. Current state: ${session.state}`);
         }
 
         const lastMessage = session.history[session.history.length - 1];
 
-        const contract: SharedTaskContract = {
-            contractId: uuidv4(),
-            correlationId: lastMessage.correlationId,
-            status: 'PROPOSED',
+        const contract = ContractFactory.createContract({
+            correlationId: lastMessage.correlationId || lastMessage.messageId,
             participatingAgents: [lastMessage.sender.id, lastMessage.recipient.id],
-            terms: {
-                validUntil: lastMessage.content.deadline,
-                governingLaw: 'Autonomous Agent Code v1',
-                arbitrationVenue: 'Decentralized Coordination Service'
-            },
+            scope: lastMessage.content.scope,
             deliverables: lastMessage.content.scope.tasks.map(task => ({
                 name: task,
-                description: task,
-                targetValue: 1, // Default
-                unit: 'completion',
-                weight: 1 / lastMessage.content.scope.tasks.length
+                description: `Automated deliverable for task: ${task}`,
+                metric: 'Completion',
+                targetValue: 1,
+                verificationMethod: 'Agent Confirmation'
             })),
-            compensation: {
-                budget: lastMessage.content.resources.budget,
-                paymentTerms: 'On completion'
+            compensation: lastMessage.content.resources,
+            deadlines: {
+                overallCompletion: lastMessage.content.deadline,
+                milestones: []
             },
-            penaltyClauses: [],
-            auditTrail: [],
-            metadata: {},
-            signatures: [],
-            timestamp: new Date().toISOString()
-        };
+            status: 'ACTIVE'
+        });
 
-        contract.status = 'ACTIVE';
         this.contracts.set(contract.contractId, contract);
         session.contract = contract;
 
@@ -134,9 +135,17 @@ export class CoordinationService {
         const contract = this.contracts.get(contractId);
         if (!contract) throw new Error('Contract not found');
 
-        contract.status = 'COMPLETED'; // Simplified transition
-        const report = this.settlementEngine.processSettlement(contract, outcomes);
+        // Note: SettlementEngine.processSettlement handles status validation internally
+        // But we need to make sure the contract status is set to something it expects
+        // Here we update it via factory-like logic or just cast if needed, 
+        // but SharedTaskContract in memory can be modified if not frozen, 
+        // yet Factory returns a frozen object. 
+        // For the sake of this service, we'll assume we can pass a "completed" version.
 
+        const completedContract = { ...contract, status: 'COMPLETED' as const };
+        const report = this.settlementEngine.processSettlement(completedContract, outcomes);
+
+        this.contracts.set(contractId, completedContract);
         return report;
     }
 
