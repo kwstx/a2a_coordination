@@ -1,5 +1,6 @@
 
 import { AgentCoordinationMessage } from '../schema/MessageSchema';
+import { AuditSink } from '../audit/ImmutableAuditLog';
 import {
     CoordinationPolicy,
     ValidationResponse,
@@ -15,6 +16,7 @@ import {
  * business rules, legal constraints, and compliance standards.
  */
 export class CoordinationPolicyValidator {
+    public constructor(private readonly auditSink?: AuditSink) { }
 
     /**
      * Evaluates a message against a specific policy.
@@ -27,10 +29,22 @@ export class CoordinationPolicyValidator {
         policy: CoordinationPolicy
     ): ValidationResponse {
         const violations: PolicyViolation[] = [];
+        const sessionId = message.correlationId ?? message.messageId;
 
         // Create a clone for potential modifications
         const modifiedMessage: AgentCoordinationMessage = JSON.parse(JSON.stringify(message));
         let wasModified = false;
+
+        this.auditSink?.record({
+            domain: 'VALIDATION',
+            action: 'VALIDATION_STARTED',
+            outcome: 'INFO',
+            correlationId: message.correlationId,
+            sessionId,
+            messageId: message.messageId,
+            actorId: message.sender.id,
+            details: { policyId: policy.id }
+        });
 
         // Validate different policy domains
         if (policy.economic) {
@@ -52,6 +66,40 @@ export class CoordinationPolicyValidator {
         }
 
         const hasReject = violations.some(v => v.severity === ViolationSeverity.REJECT);
+        for (const violation of violations) {
+            this.auditSink?.record({
+                domain: violation.severity === ViolationSeverity.REJECT ? 'REJECTION' : 'VALIDATION',
+                action: 'VALIDATION_VIOLATION',
+                outcome: violation.severity === ViolationSeverity.REJECT ? 'FAILURE' : 'WARNING',
+                correlationId: message.correlationId,
+                sessionId,
+                messageId: message.messageId,
+                actorId: message.sender.id,
+                details: {
+                    policyId: violation.policyId,
+                    ruleId: violation.ruleId,
+                    severity: violation.severity,
+                    path: violation.path,
+                    message: violation.message
+                }
+            });
+        }
+
+        this.auditSink?.record({
+            domain: 'VALIDATION',
+            action: 'VALIDATION_COMPLETED',
+            outcome: hasReject ? 'FAILURE' : (violations.length > 0 ? 'WARNING' : 'SUCCESS'),
+            correlationId: message.correlationId,
+            sessionId,
+            messageId: message.messageId,
+            actorId: message.sender.id,
+            details: {
+                policyId: policy.id,
+                isValid: !hasReject,
+                violationCount: violations.length,
+                modified: wasModified
+            }
+        });
 
         return {
             isValid: !hasReject,

@@ -1,5 +1,6 @@
 import { AgentCoordinationMessage, MessageType } from '../schema/MessageSchema';
 import { ConflictDetail, ConflictResolutionEngine } from './ConflictResolutionEngine';
+import { AuditSink } from '../audit/ImmutableAuditLog';
 
 export enum NegotiationState {
   PROPOSAL = 'PROPOSAL',
@@ -84,6 +85,7 @@ export interface NegotiationEngineConfig {
   economicGuardrails?: EconomicGuardrails;
   conflictResolutionEngine?: ConflictResolutionEngine;
   renegotiationHandler?: RenegotiationHandler;
+  auditSink?: AuditSink;
 }
 
 export interface RenegotiationContext {
@@ -119,17 +121,51 @@ export class NegotiationEngine {
 
   public process(message: AgentCoordinationMessage): TransitionResult {
     const nextState = STATE_FROM_MESSAGE_TYPE[message.type];
+    const sessionId = message.correlationId ?? message.messageId;
+    this.config.auditSink?.record({
+      domain: 'NEGOTIATION',
+      action: 'NEGOTIATION_STEP_RECEIVED',
+      outcome: 'INFO',
+      correlationId: message.correlationId,
+      sessionId,
+      messageId: message.messageId,
+      actorId: message.sender.id,
+      details: {
+        type: message.type,
+        targetState: nextState
+      }
+    });
+
     if (!nextState) {
+      this.config.auditSink?.record({
+        domain: 'REJECTION',
+        action: 'NEGOTIATION_STEP_REJECTED',
+        outcome: 'FAILURE',
+        correlationId: message.correlationId,
+        sessionId,
+        messageId: message.messageId,
+        actorId: message.sender.id,
+        details: { reason: `Message type "${message.type}" is not a valid negotiation transition.` }
+      });
       return {
         accepted: false,
         reason: `Message type "${message.type}" is not a valid negotiation transition.`
       };
     }
 
-    const sessionId = message.correlationId ?? message.messageId;
     const session = this.sessions.get(sessionId) ?? { id: sessionId, state: null };
 
     if (this.pausedSessions.has(sessionId) && !message.metadata?.renegotiation?.resolutionAccepted) {
+      this.config.auditSink?.record({
+        domain: 'REJECTION',
+        action: 'NEGOTIATION_PAUSED_REJECTION',
+        outcome: 'FAILURE',
+        correlationId: message.correlationId,
+        sessionId,
+        messageId: message.messageId,
+        actorId: message.sender.id,
+        details: { reason: `Session "${sessionId}" is paused until renegotiation confirms conflict resolution.` }
+      });
       return {
         accepted: false,
         reason: `Session "${sessionId}" is paused until renegotiation confirms conflict resolution.`,
@@ -140,6 +176,19 @@ export class NegotiationEngine {
 
     const predecessor = REQUIRED_PREDECESSOR[nextState];
     if (session.state !== predecessor) {
+      this.config.auditSink?.record({
+        domain: 'REJECTION',
+        action: 'NEGOTIATION_INVALID_TRANSITION',
+        outcome: 'FAILURE',
+        correlationId: message.correlationId,
+        sessionId,
+        messageId: message.messageId,
+        actorId: message.sender.id,
+        details: {
+          expected: predecessor ?? 'NONE',
+          found: session.state ?? 'NONE'
+        }
+      });
       return {
         accepted: false,
         reason: `Invalid transition. Expected "${predecessor ?? 'NONE'}" before "${nextState}", found "${session.state ?? 'NONE'}".`
@@ -162,6 +211,16 @@ export class NegotiationEngine {
     if (message.metadata?.renegotiation?.resolutionAccepted) {
       this.pausedSessions.delete(sessionId);
     }
+    this.config.auditSink?.record({
+      domain: 'APPROVAL',
+      action: 'NEGOTIATION_STEP_ACCEPTED',
+      outcome: 'SUCCESS',
+      correlationId: message.correlationId,
+      sessionId,
+      messageId: message.messageId,
+      actorId: message.sender.id,
+      details: { state: nextState }
+    });
     return { accepted: true, state: nextState, action: 'ALLOW' };
   }
 
@@ -177,8 +236,23 @@ export class NegotiationEngine {
     message: AgentCoordinationMessage,
     nextState: NegotiationState
   ): TransitionResult {
+    const sessionId = message.correlationId ?? message.messageId;
+    const reject = (reason: string, action?: TransitionResult['action']): TransitionResult => {
+      this.config.auditSink?.record({
+        domain: 'REJECTION',
+        action: 'NEGOTIATION_GATE_REJECTED',
+        outcome: 'FAILURE',
+        correlationId: message.correlationId,
+        sessionId,
+        messageId: message.messageId,
+        actorId: message.sender.id,
+        details: { state: nextState, reason, action: action ?? 'BLOCK' }
+      });
+      return { accepted: false, reason, action };
+    };
+
     if (!this.config.identityVerifier.verify(message)) {
-      return { accepted: false, reason: 'Identity verification failed.' };
+      return reject('Identity verification failed.');
     }
 
     const reputation = this.config.reputationProvider.getScore(message.sender.id);
@@ -190,18 +264,16 @@ export class NegotiationEngine {
       : this.config.minimumReputationScore;
 
     if (reputation < minRep) {
-      return {
-        accepted: false,
-        reason: `Reputation score ${reputation.toFixed(2)} is below required threshold ${minRep.toFixed(2)} for this transaction.`
-      };
+      return reject(
+        `Reputation score ${reputation.toFixed(2)} is below required threshold ${minRep.toFixed(2)} for this transaction.`
+      );
     }
 
     if (budget.amount > budget.limit) {
-      return {
-        accepted: false,
-        reason: `Requested budget amount ${budget.amount} exceeds declared limit ${budget.limit}.`,
-        action: nextState === NegotiationState.FINAL_COMMITMENT ? 'BLOCK' : 'RENEGOTIATE'
-      };
+      return reject(
+        `Requested budget amount ${budget.amount} exceeds declared limit ${budget.limit}.`,
+        nextState === NegotiationState.FINAL_COMMITMENT ? 'BLOCK' : 'RENEGOTIATE'
+      );
     }
 
     const availableBudget = this.config.budgetProvider.getAvailableBudget(
@@ -209,24 +281,35 @@ export class NegotiationEngine {
       budget.currency
     );
     if (budget.amount > availableBudget) {
-      return {
-        accepted: false,
-        reason: `Requested budget amount ${budget.amount} exceeds available budget ${availableBudget}.`,
-        action: nextState === NegotiationState.FINAL_COMMITMENT ? 'BLOCK' : 'RENEGOTIATE'
-      };
+      return reject(
+        `Requested budget amount ${budget.amount} exceeds available budget ${availableBudget}.`,
+        nextState === NegotiationState.FINAL_COMMITMENT ? 'BLOCK' : 'RENEGOTIATE'
+      );
     }
 
     const economicResult = this.validateEconomicViability(message, nextState);
     if (economicResult) {
+      this.config.auditSink?.record({
+        domain: 'REJECTION',
+        action: 'ECONOMIC_GUARDRAIL_REJECTED',
+        outcome: 'FAILURE',
+        correlationId: message.correlationId,
+        sessionId,
+        messageId: message.messageId,
+        actorId: message.sender.id,
+        details: {
+          state: nextState,
+          action: economicResult.action,
+          reason: economicResult.reason,
+          violations: economicResult.economicViolations
+        }
+      });
       return economicResult;
     }
 
     const requiredPermission = REQUIRED_PERMISSION[nextState];
     if (!this.config.authorityProvider.hasPermission(message.sender.id, requiredPermission)) {
-      return {
-        accepted: false,
-        reason: `Sender "${message.sender.id}" lacks authority "${requiredPermission}".`
-      };
+      return reject(`Sender "${message.sender.id}" lacks authority "${requiredPermission}".`);
     }
 
     if (nextState === NegotiationState.FINAL_COMMITMENT) {
@@ -235,24 +318,30 @@ export class NegotiationEngine {
         | undefined;
 
       if (!commitmentMetadata?.isFormal || !commitmentMetadata?.verificationToken) {
-        return {
-          accepted: false,
-          reason: 'Final commitment must be formal and include a verification token.'
-        };
+        return reject('Final commitment must be formal and include a verification token.');
       }
 
       // Commitment Priority and Validation
       if (this.config.reputationProvider.validateCommitmentPriority) {
         const priorityInfo = this.config.reputationProvider.validateCommitmentPriority(message);
         if (priorityInfo.requiresEscrow && !message.metadata?.escrowId) {
-          return {
-            accepted: false,
-            reason: `Low reputation agent "${message.sender.id}" requires an Escrow ID for final commitment.`
-          };
+          return reject(
+            `Low reputation agent "${message.sender.id}" requires an Escrow ID for final commitment.`
+          );
         }
       }
     }
 
+    this.config.auditSink?.record({
+      domain: 'NEGOTIATION',
+      action: 'NEGOTIATION_GATES_PASSED',
+      outcome: 'SUCCESS',
+      correlationId: message.correlationId,
+      sessionId,
+      messageId: message.messageId,
+      actorId: message.sender.id,
+      details: { state: nextState }
+    });
     return { accepted: true, state: nextState, action: 'ALLOW' };
   }
 
@@ -337,10 +426,29 @@ export class NegotiationEngine {
 
     const conflictCheck = this.config.conflictResolutionEngine.evaluate(message, sessionId);
     if (!conflictCheck.hasConflict) {
+      this.config.auditSink?.record({
+        domain: 'NEGOTIATION',
+        action: 'CONFLICT_CHECK_CLEARED',
+        outcome: 'SUCCESS',
+        correlationId: message.correlationId,
+        sessionId,
+        messageId: message.messageId,
+        actorId: message.sender.id
+      });
       return null;
     }
 
     this.pausedSessions.add(sessionId);
+    this.config.auditSink?.record({
+      domain: 'REJECTION',
+      action: 'CONFLICT_DETECTED',
+      outcome: 'FAILURE',
+      correlationId: message.correlationId,
+      sessionId,
+      messageId: message.messageId,
+      actorId: message.sender.id,
+      details: { conflicts: conflictCheck.conflicts }
+    });
     this.config.renegotiationHandler?.trigger({
       sessionId,
       message,
